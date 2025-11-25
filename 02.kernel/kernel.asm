@@ -10,22 +10,78 @@ org 0x0000
 ; ---------------------------------------------------------
 BUFFER_SEG      equ 0x2000
 VIDEO_SEG       equ 0xA000
+CANVAS_SEG      equ 0x3000  ; 캔버스 데이터 세그먼트
+
 SCREEN_WIDTH    equ 319
 SCREEN_HEIGHT   equ 199
+SCREEN_PITCH    equ 320      ; 한 줄에 실제 픽셀 수(320)
+
+CANVAS_WIDTH    equ 310    ; window_width(312) - 좌우 테두리 1px * 2
+CANVAS_HEIGHT   equ 166    ; window_height(180) - title_bar(12) - 상/하 테두리(2)
+
+PAINT_COLOR      equ 0x00     ; 기본 색(검정) - 초기값
+CANVAS_BG_COLOR  equ 0x0F     ; 배경(흰색)
+
+PALETTE_COUNT       equ 4
+PALETTE_CELL_SIZE   equ 8
+PALETTE_STEP        equ 10     ; 셀(8px) + 간격(2px)
+
+paint_color:    db PAINT_COLOR
+
+; --- 그리기 모드 정의 ---
+DRAW_MODE_PEN      equ 0
+DRAW_MODE_LINE     equ 1
+DRAW_MODE_RECT     equ 2
+DRAW_MODE_CIRCLE   equ 3        ; (알고리즘 설명만)
+DRAW_MODE_ELLIPSE  equ 4        ; (알고리즘 설명만)
+
+current_draw_mode: db DRAW_MODE_PEN   ; 기본은 펜
+
+; --- 도형 시작/끝점 & 상태 ---
+shape_pending: db 0        ; 0: 없음, 1: 시작점 저장됨
+shape_start_x: dw 0
+shape_start_y: dw 0
+shape_end_x:   dw 0
+shape_end_y:   dw 0
+
+; --- 선(Bresenham)용 임시 변수 ---
+line_dx:   dw 0
+line_dy:   dw 0
+line_sx:   dw 0
+line_sy:   dw 0
+line_err:  dw 0
+line_e2:   dw 0
+line_x1:   dw 0
+line_y1:   dw 0
+
+; --- 사각형 계산용 임시 변수 ---
+rect_x0: dw 0
+rect_y0: dw 0
+rect_x1: dw 0
+rect_y1: dw 0
+
+; 팔레트에 표시할 색들 (순서대로)
+palette_colors:
+    db 0x00, 0x04, 0x02, 0x01   ; 검정, 빨강, 초록, 파랑
+
+; 각 팔레트 셀의 X 오프셋 (window_x 기준)
+; window_x + 4, 14, 24, 34에 놓인다고 보면 됨
+palette_x_offsets:
+    db 4, 14, 24, 34
 
 ; --- 창(Window) 관련 변수 ---
-window_x:       dw 100
-window_y:       dw 80
-window_width:   dw 140
-window_height:  dw 80
-title_bar_height: dw 12
-window_title:   db "Hyeongwaha OS", 0x00
+window_x:       dw 4          ; 왼쪽에서 약간만 띄움
+window_y:       dw 4          ; 위쪽에서 약간만 띄움
+window_width:   dw 312        ; 폭 많이 키움 (0..319 중 4~315 사용)
+window_height:  dw 180        ; 높이 많이 키움 (아래 taskbar 위까지)
+title_bar_height: dw 12       ; 그대로
+window_title:   db "Hyungwaha OS", 0x00
 is_window_open: db 0
 
 ; 닫기 버튼
 close_btn_size: dw 8
-close_btn_off_x: dw 130
-close_btn_off_y: dw 2
+close_btn_off_x: dw 2      ; 오른쪽 테두리로부터 여백 2px
+close_btn_off_y: dw 2      ; 위쪽 여백 그대로
 
 ; --- 작업 표시줄 관련 변수 ---
 taskbar_height: dw 14
@@ -116,6 +172,7 @@ start_kernel:
 
 .main_loop:
     call update_system_time
+    call check_keyboard_tool     
     mov word [needs_redraw], 1
 
     in al, 0x64
@@ -142,6 +199,49 @@ start_kernel:
 
 .next_loop:
     jmp .main_loop
+; ---------------------------------------------------------
+; [키보드 입력] 1/2/3으로 그리기 모드 변경
+;   '1' : 펜
+;   '2' : 직선
+;   '3' : 사각형
+;   (추후 '4','5'를 원/타원으로 쓸 수 있음)
+; ---------------------------------------------------------
+check_keyboard_tool:
+    push ax
+    push bx
+
+    mov ah, 01h          ; 키가 눌렸는지 확인
+    int 16h
+    jz .no_key           ; 안 눌렸으면 바로 리턴
+
+    mov ah, 00h          ; 키 읽기
+    int 16h              ; AL = ASCII 코드
+
+    cmp al, '1'
+    je .mode_pen
+    cmp al, '2'
+    je .mode_line
+    cmp al, '3'
+    je .mode_rect
+    ; 추후 '4','5' 추가 가능
+    jmp .no_key
+
+.mode_pen:
+    mov byte [current_draw_mode], DRAW_MODE_PEN
+    jmp .no_key
+
+.mode_line:
+    mov byte [current_draw_mode], DRAW_MODE_LINE
+    jmp .no_key
+
+.mode_rect:
+    mov byte [current_draw_mode], DRAW_MODE_RECT
+    jmp .no_key
+
+.no_key:
+    pop bx
+    pop ax
+    ret
 
 ; ---------------------------------------------------------
 ; [시스템 종료 로직 (APM)]
@@ -249,11 +349,57 @@ copy_buffer_to_screen:
     pop ds
     pop es
     ret
+; ---------------------------------------------------------
+; [캔버스 픽셀 찍기]
+;   입력:
+;       AX = canvas_y (0..CANVAS_HEIGHT-1)
+;       BX = canvas_x (0..CANVAS_WIDTH-1)
+;   동작:
+;       범위 체크 후 CANVAS_SEG 메모리에 paint_color로 1픽셀 기록
+; ---------------------------------------------------------
+app_plot_pixel:
+    push dx
+    push di
+    push es
+    push ax
+    push bx
 
+    ; x 범위 체크
+    cmp bx, 0
+    jl  .done
+    cmp bx, CANVAS_WIDTH
+    jge .done
+
+    ; y 범위 체크
+    cmp ax, 0
+    jl  .done
+    cmp ax, CANVAS_HEIGHT
+    jge .done
+
+    ; offset = y * CANVAS_WIDTH + x
+    mov dx, CANVAS_WIDTH
+    mul dx                  ; DX:AX = AX * DX (y * width)
+    add ax, bx              ; AX = offset
+    mov di, ax
+
+    mov ax, CANVAS_SEG
+    mov es, ax
+    mov al, [paint_color]
+    mov [es:di], al
+
+.done:
+    pop bx
+    pop ax
+    pop es
+    pop di
+    pop dx
+    ret
 ; ---------------------------------------------------------
 ; [이벤트 로직]
 ; ---------------------------------------------------------
 handle_drag_logic:
+    ; [추가] 그림판 입력 처리 호출 (드래그 확인 전에 체크)
+    call app_handle_input
     cmp byte [mouse_btn_left], 1
     je .btn_down
     mov byte [is_dragging], 0
@@ -276,7 +422,12 @@ handle_drag_logic:
     call is_in_taskbar_btn
     cmp ax, 1
     jne .check_window_click
+    ; [수정] 이미 열려있으면 초기화하지 않고, 닫혀있을 때만 열고 초기화
+    cmp byte [is_window_open], 1
+    je .update_history
+    
     mov byte [is_window_open], 1
+    call app_init           ; [추가] 앱 열릴 때 캔버스 초기화
     mov word [needs_redraw], 1
     jmp .update_history
 
@@ -380,22 +531,33 @@ is_in_off_btn:          ; [추가] 전원 버튼 충돌 체크
     ret
 
 is_in_close_btn:
+    ; btn_x = window_x + window_width - close_btn_size - close_btn_off_x
     mov ax, [window_x]
-    add ax, [close_btn_off_x]
-    cmp [mouse_x], ax
+    add ax, [window_width]
+    sub ax, [close_btn_size]
+    sub ax, [close_btn_off_x]     ; AX = btn_x
+
+    ; X 범위 체크: [btn_x, btn_x + close_btn_size)
+    mov dx, ax                    ; DX = btn_x
+    cmp [mouse_x], dx
     jl .ret_false_close
-    add ax, [close_btn_size]
-    cmp [mouse_x], ax
-    jg .ret_false_close
+    add dx, [close_btn_size]
+    cmp [mouse_x], dx
+    jge .ret_false_close
+
+    ; Y 범위 체크: [window_y + off_y, window_y + off_y + close_btn_size)
     mov ax, [window_y]
-    add ax, [close_btn_off_y]
-    cmp [mouse_y], ax
+    add ax, [close_btn_off_y]     ; AX = btn_y
+    mov dx, ax                    ; DX = btn_y
+    cmp [mouse_y], dx
     jl .ret_false_close
-    add ax, [close_btn_size]
-    cmp [mouse_y], ax
-    jg .ret_false_close
+    add dx, [close_btn_size]
+    cmp [mouse_y], dx
+    jge .ret_false_close
+
     mov ax, 1
     ret
+
 .ret_false_close:
     xor ax, ax
     ret
@@ -448,6 +610,8 @@ is_in_taskbar_btn:
 draw_window:
     push bp
     mov bp, sp
+
+    ; 창 외곽 테두리
     push word [border_color]
     push word [window_height]
     push word [window_width]
@@ -455,6 +619,8 @@ draw_window:
     push word [window_x]
     call draw_rect_param
     add sp, 10
+
+    ; 타이틀바
     mov ax, [window_x]
     inc ax
     mov bx, [window_y]
@@ -468,6 +634,8 @@ draw_window:
     push ax
     call draw_rect_param
     add sp, 10
+
+    ; 내용 영역(흰색 배경)
     mov ax, [window_x]
     inc ax
     mov bx, [window_y]
@@ -484,6 +652,8 @@ draw_window:
     push ax
     call draw_rect_param
     add sp, 10
+
+    ; 타이틀 문자열
     mov ax, [window_x]
     add ax, 4
     mov bx, [window_y]
@@ -494,29 +664,94 @@ draw_window:
     push ax
     call draw_string_param
     add sp, 8
+
+    ; --- 닫기 버튼 사각형 그리기 (우측 상단) ---
+    ; btn_x = window_x + window_width - close_btn_size - close_btn_off_x
     mov ax, [window_x]
-    add ax, [close_btn_off_x]
+    add ax, [window_width]
+    sub ax, [close_btn_size]
+    sub ax, [close_btn_off_x]     ; 오른쪽에서 여백만큼 안쪽
+    mov dx, ax                    ; DX = btn_x
+
     mov bx, [window_y]
-    add bx, [close_btn_off_y]
+    add bx, [close_btn_off_y]     ; btn_y
+
     push word [close_btn_color]
     push word [close_btn_size]
     push word [close_btn_size]
-    push bx
-    push ax
+    push bx                       ; y
+    push dx                       ; x
     call draw_rect_param
     add sp, 10
-    mov ax, [window_x]
-    add ax, [close_btn_off_x]
+
+    ; --- 그림판 캔버스 내용 그리기 ---
+    call app_draw_content
+
+    ; --- 'X' 문자 그리기 (버튼 안쪽에)
+    mov ax, dx                    ; btn_x
+    add ax, 2                     ; 약간 안쪽으로
     mov bx, [window_y]
     add bx, [close_btn_off_y]
+    add bx, 1                     ; 세로로도 약간 내림
+
     push word 0x0F
     push str_x
     push bx
     push ax
     call draw_string_param
     add sp, 8
+
+    ; ============================================
+    ; 5번: 색상 팔레트 그리기 (내용 영역 상단 왼쪽)
+    ; ============================================
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+
+    mov cx, PALETTE_COUNT         ; 색 개수 (예: 4)
+    xor si, si                    ; 인덱스 0..3
+
+.palette_draw_loop:
+    ; 색값 읽기
+    mov bx, palette_colors
+    mov dl, [bx+si]               ; DL = 색상
+    xor dh, dh                    ; DX = color (word)
+
+    ; x = window_x + palette_x_offsets[si]
+    mov bx, palette_x_offsets
+    mov al, [bx+si]
+    xor ah, ah
+    add ax, [window_x]            ; AX = x
+
+    ; y = window_y + title_bar_height + 2
+    mov bx, [window_y]
+    add bx, [title_bar_height]
+    add bx, 2                     ; BX = y
+
+    ; 작은 사각형으로 팔레트 셀 그리기
+    push dx                       ; color
+    push word PALETTE_CELL_SIZE   ; height
+    push word PALETTE_CELL_SIZE   ; width
+    push bx                       ; y
+    push ax                       ; x
+    call draw_rect_param
+    add sp, 10
+
+    inc si
+    loop .palette_draw_loop
+
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ; ============================================
+
     pop bp
     ret
+    
 
 draw_taskbar:
     push bp
@@ -714,9 +949,81 @@ draw_char_param:
     pop bp
     ret
 
+; ---------------------------------------------------------
+; [커서 그리기] 흰색 커서 + 검은 테두리
+;   - draw_cursor_at()을 여러 번 호출해서
+;     테두리(검정) 4방향 + 중앙(흰색)을 그림
+; ---------------------------------------------------------
 draw_arrow_cursor:
     push bp
     mov bp, sp
+
+    ; 1) 테두리 색: 검정 (0x00)
+    ; 왼쪽 (x-1, y)
+    mov ax, [mouse_x]
+    dec ax
+    mov dx, [mouse_y]
+    push word 0x00          ; color = black
+    push dx                 ; base_y
+    push ax                 ; base_x
+    call draw_cursor_at
+    add sp, 6
+
+    ; 오른쪽 (x+1, y)
+    mov ax, [mouse_x]
+    inc ax
+    mov dx, [mouse_y]
+    push word 0x00
+    push dx
+    push ax
+    call draw_cursor_at
+    add sp, 6
+
+    ; 위 (x, y-1)
+    mov ax, [mouse_x]
+    mov dx, [mouse_y]
+    dec dx
+    push word 0x00
+    push dx
+    push ax
+    call draw_cursor_at
+    add sp, 6
+
+    ; 아래 (x, y+1)
+    mov ax, [mouse_x]
+    mov dx, [mouse_y]
+    inc dx
+    push word 0x00
+    push dx
+    push ax
+    call draw_cursor_at
+    add sp, 6
+
+    ; 2) 가운데 커서: 흰색 (0x0F)
+    mov ax, [mouse_x]
+    mov dx, [mouse_y]
+    push word 0x0F          ; color = white
+    push dx
+    push ax
+    call draw_cursor_at
+    add sp, 6
+
+    pop bp
+    ret
+; ---------------------------------------------------------
+; [헬퍼] draw_cursor_at
+;   인자 (stack):
+;     [bp+4]  = base_x (word)
+;     [bp+6]  = base_y (word)
+;     [bp+8]  = color  (byte, word로 푸시됨)
+;   역할:
+;     cursor_bitmap(16x16)을 (base_x, base_y)에 color로 그림
+;     화면 밖으로 나가는 부분은 안전하게 클리핑
+; ---------------------------------------------------------
+draw_cursor_at:
+    push bp
+    mov bp, sp
+
     push ax
     push bx
     push cx
@@ -724,47 +1031,77 @@ draw_arrow_cursor:
     push si
     push di
     push es
-    mov ax, BUFFER_SEG 
+
+    ; 화면 버퍼 세그먼트 설정
+    mov ax, BUFFER_SEG
     mov es, ax
+
+    ; 커서 비트맵 시작 주소
     mov si, cursor_bitmap
-    mov dx, [mouse_y]
-    mov cx, 16
+
+    ; 현재 y = base_y
+    mov dx, [bp+6]
+    mov cx, 16              ; 총 16줄
+
 .row_loop:
+    ; --- 세로 클리핑 ---
+    cmp dx, 0
+    jl .row_next            ; 화면 위쪽(음수) → 이 줄 스킵
     cmp dx, SCREEN_HEIGHT
-    jge .end_draw
-    mov bx, [si]
-    push cx
-    mov cx, 16
-    mov di, [mouse_x]
+    jge .row_next           ; 화면 아래쪽 넘으면 스킵
+
+    ; 이 줄은 화면 안에 있으니, 픽셀 단위 루프 진행
+    push cx                 ; 바깥 루프 카운트 보존
+
+    mov bx, [si]            ; 현재 줄의 16비트 패턴
+    mov cx, 16              ; 가로 16픽셀
+    mov di, [bp+4]          ; x = base_x
+
 .pixel_loop:
     test bx, 0x8000
     jz .skip_pixel
+
+    ; --- 가로 클리핑 ---
     cmp di, 0
-    jl .skip_pixel
+    jl  .skip_pixel2
     cmp di, SCREEN_WIDTH
-    jge .skip_pixel
-    push bx
+    jg  .skip_pixel2
+
+    ; 여기까지 왔으면 (di, dx)가 화면 안
+    ; 오프셋 = y*320 + x
+    push ax
     push dx
+    push bx
+
     mov ax, dx
     mov bx, ax
     shl ax, 8
     shl bx, 6
-    add ax, bx
-    add ax, di
+    add ax, bx              ; ax = y*320
+    add ax, di              ; ax = y*320 + x
     mov bx, ax
-    mov byte [es:bx], 0x0F
-    pop dx
+
+    mov al, byte [bp+8]     ; color
+    mov [es:bx], al
+
     pop bx
+    pop dx
+    pop ax
+
+.skip_pixel2:
 .skip_pixel:
-    shl bx, 1
-    inc di
+    shl bx, 1               ; 다음 비트
+    inc di                  ; x++
     dec cx
     jnz .pixel_loop
-    pop cx
-    add si, 2
-    inc dx
+
+    pop cx                  ; 바깥 루프 카운트 복원
+
+.row_next:
+    add si, 2               ; 다음 비트맵 줄
+    inc dx                  ; y++
     loop .row_loop
-.end_draw:
+
     pop es
     pop di
     pop si
@@ -773,6 +1110,48 @@ draw_arrow_cursor:
     pop bx
     pop ax
     pop bp
+    ret
+; ---------------------------------------------------------
+; [헬퍼] canvas_from_mouse
+;   입력:  [mouse_x], [mouse_y], [window_x], [window_y], [title_bar_height]
+;   출력:
+;       CF = 0이면 캔버스 안에 있음
+;           AX = canvas_y (0 .. CANVAS_HEIGHT-1)
+;           BX = canvas_x (0 .. CANVAS_WIDTH-1)
+;       CF = 1이면 캔버스 밖
+; ---------------------------------------------------------
+canvas_from_mouse:
+    push dx
+
+    ; X 방향: mouse_x - window_x - 1(왼쪽 테두리)
+    mov ax, [mouse_x]
+    sub ax, [window_x]
+    sub ax, 1                       ; 왼쪽 테두리 1px
+
+    cmp ax, 0
+    jl  .outside
+    cmp ax, CANVAS_WIDTH
+    jge .outside
+    mov bx, ax                      ; BX = canvas_x
+
+    ; Y 방향: mouse_y - window_y - title_bar_height
+    mov ax, [mouse_y]
+    sub ax, [window_y]
+    sub ax, [title_bar_height]
+
+    cmp ax, 0
+    jl  .outside
+    cmp ax, CANVAS_HEIGHT
+    jge .outside
+
+    ; 여기까지 왔으면 (BX, AX)가 유효한 캔버스 좌표
+    clc                             ; CF=0 (inside)
+    pop dx
+    ret
+
+.outside:
+    stc                             ; CF=1 (outside)
+    pop dx
     ret
 
 ; ---------------------------------------------------------
@@ -869,7 +1248,443 @@ update_mouse_position:
     pop bx
     pop ax
     ret
+; ---------------------------------------------------------
+; [앱 초기화] 캔버스 메모리를 흰색으로 채움
+; ---------------------------------------------------------
+app_init:
+    push ax
+    push cx
+    push di
+    push es
 
+    mov ax, CANVAS_SEG
+    mov es, ax
+    xor di, di
+    mov cx, CANVAS_WIDTH * CANVAS_HEIGHT   ; 138 * 66 = 9108 바이트
+    mov al, CANVAS_BG_COLOR                ; 흰색
+    rep stosb
+
+    pop es
+    pop di
+    pop cx
+    pop ax
+    ret
+; ---------------------------------------------------------
+; [앱 입력 처리]
+;   - 창 열려 있을 때만 동작
+;   - 현재 그리기 모드에 따라 동작 분기
+;       * 펜 모드 : 버튼 누른 동안 계속 점 찍기
+;       * 선/사각형 : 첫 클릭에 시작점 저장, 버튼을 뗄 때 도형 한 번 그림
+;   - 팔레트 클릭은 기존처럼 먼저 처리
+; ---------------------------------------------------------
+app_handle_input:
+    ; 창이 안 열려 있으면 무시
+    cmp byte [is_window_open], 1
+    jne .end
+
+    ; 현재/이전 마우스 버튼 상태 읽기
+    mov bl, [mouse_btn_last]   ; 이전 프레임 상태
+    mov bh, [mouse_btn_left]   ; 현재 상태 (0 or 1)
+
+    ; ------------------------
+    ; 1) 색상 팔레트 클릭 (현재가 눌린 상태면 매번 확인해도 무방)
+    ; ------------------------
+    cmp bh, 1
+    jne .after_palette
+
+    call app_check_palette_click
+    cmp ax, 1
+    je .end                    ; 팔레트 클릭이면 여기서 끝
+
+.after_palette:
+
+    ; ------------------------
+    ; 2) 펜 모드 (DRAW_MODE_PEN)
+    ; ------------------------
+    cmp byte [current_draw_mode], DRAW_MODE_PEN
+    jne .shape_mode
+
+    ; 펜 모드에서는 버튼이 눌려 있는 동안 계속 점 찍기
+    cmp bh, 1
+    jne .end
+
+    call canvas_from_mouse
+    jc   .end                  ; 캔버스 밖이면 무시
+
+    ; AX = canvas_y, BX = canvas_x
+    call app_plot_pixel
+    mov word [needs_redraw], 1
+    jmp .end
+
+; ------------------------
+; 3) 도형 모드 (선/사각형 등)
+; ------------------------
+.shape_mode:
+    ; (1) 버튼이 눌리는 순간 (bl=0, bh=1) → 시작점 저장
+    cmp bl, 0
+    jne .check_release
+    cmp bh, 1
+    jne .check_release
+
+    ; 시작점 = 클릭 위치 (캔버스 안일 때만)
+    call canvas_from_mouse
+    jc   .end                   ; 캔버스 밖에서 누르면 무시
+
+    mov [shape_start_y], ax
+    mov [shape_start_x], bx
+    mov byte [shape_pending], 1
+    jmp .end
+
+.check_release:
+    ; (2) 버튼을 떼는 순간 (bl=1, bh=0) → 끝점 + 도형 그리기
+    cmp bl, 1
+    jne .end
+    cmp bh, 0
+    jne .end
+
+    cmp byte [shape_pending], 1
+    jne .end                    ; 시작점 없으면 무시
+
+    ; 끝점 = 버튼 뗀 위치 (캔버스 안일 때만)
+    call canvas_from_mouse
+    jc   .cancel_shape          ; 캔버스 밖에서 떼면 취소
+
+    mov [shape_end_y], ax
+    mov [shape_end_x], bx
+
+    ; 현재 모드에 따라 선/사각형 그리기
+    mov al, [current_draw_mode]
+    cmp al, DRAW_MODE_LINE
+    je  .do_line
+    cmp al, DRAW_MODE_RECT
+    je  .do_rect
+    jmp .finish_shape           ; (원/타원 모드 아직은 미구현)
+
+.do_line:
+    call draw_line_shape
+    jmp .finish_shape
+
+.do_rect:
+    call draw_rect_shape
+    jmp .finish_shape
+
+.cancel_shape:
+    ; 취소 시 아무것도 그리지 않음
+    jmp .finish_shape
+
+.finish_shape:
+    mov byte [shape_pending], 0
+    mov word [needs_redraw], 1
+
+.end:
+    ret
+; ---------------------------------------------------------
+; [팔레트 클릭 처리]
+;   - 마우스가 팔레트 영역 안을 클릭했으면 paint_color 변경
+;   - AX = 1 : 팔레트 클릭 처리함
+;   - AX = 0 : 팔레트 영역 아님
+; ---------------------------------------------------------
+app_check_palette_click:
+    push bx
+    push cx
+    push dx
+
+    ; local_y = mouse_y - window_y - title_bar_height - 2
+    mov bx, [mouse_y]
+    sub bx, [window_y]
+    sub bx, [title_bar_height]
+    sub bx, 2                ; 제목줄 아래로 조금 내림
+
+    cmp bx, 0
+    jl  .no_hit
+    cmp bx, PALETTE_CELL_SIZE
+    jge .no_hit              ; 세로 범위 벗어남
+
+    ; local_x = mouse_x - window_x - 4
+    mov dx, [mouse_x]
+    sub dx, [window_x]
+    sub dx, 4
+
+    cmp dx, 0
+    jl  .no_hit
+
+    ; 한 셀 폭 + 간격 = PALETTE_STEP (10)
+    ; idx = local_x / 10, pos_in_step = local_x % 10
+    mov ax, dx
+    mov bl, PALETTE_STEP
+    xor ah, ah
+    div bl                   ; AL=idx, AH=remainder
+
+    cmp al, PALETTE_COUNT
+    jge .no_hit              ; 팔레트 개수 초과
+    cmp ah, PALETTE_CELL_SIZE
+    jge .no_hit              ; 간격 부분(셀 사이) 클릭
+
+    ; 여기까지 오면 AL = 팔레트 인덱스 (0..3)
+    ; paint_color = palette_colors[AL]
+    push si
+
+    xor bx, bx
+    mov bl, al               ; BX = idx
+    mov si, palette_colors
+    add si, bx
+    mov al, [si]
+    mov [paint_color], al
+
+    pop si
+
+    mov word [needs_redraw], 1
+    mov ax, 1                ; 처리함
+    jmp .done
+
+.no_hit:
+    xor ax, ax               ; 처리 안 함
+
+.done:
+    pop dx
+    pop cx
+    pop bx
+    ret
+; ---------------------------------------------------------
+; [앱 그리기] 캔버스 메모리를 화면 버퍼(BUFFER_SEG)에 복사
+;   - 캔버스 (0..CANVAS_WIDTH-1, 0..CANVAS_HEIGHT-1)를
+;   - 화면상의 (window_x+1, window_y+title_bar_height)에 맞춰 그림
+; ---------------------------------------------------------
+app_draw_content:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+
+    ; -----------------------------------------------------
+    ; 1) 커널 DS 상태에서 화면 버퍼 내 시작 위치 계산
+    ;    y0 = window_y + title_bar_height
+    ;    x0 = window_x + 1
+    ;    offset = y0 * SCREEN_PITCH + x0
+    ; -----------------------------------------------------
+    mov ax, [window_y]
+    add ax, [title_bar_height]        ; y0
+    mov bx, SCREEN_PITCH              ; 320
+    mul bx                            ; AX = y0 * 320
+
+    mov bx, [window_x]
+    add bx, 1                         ; x0
+    add ax, bx                        ; AX = y0*320 + x0
+    mov di, ax                        ; DI = 화면 버퍼 오프셋
+
+    ; -----------------------------------------------------
+    ; 2) 세그먼트 설정: DS=CANVAS_SEG, ES=BUFFER_SEG
+    ; -----------------------------------------------------
+    mov ax, CANVAS_SEG
+    mov ds, ax
+    xor si, si                        ; 캔버스 시작 (offset 0)
+
+    mov ax, BUFFER_SEG
+    mov es, ax
+
+    ; -----------------------------------------------------
+    ; 3) 줄 단위로 캔버스 → 화면 버퍼 복사
+    ; -----------------------------------------------------
+    mov cx, CANVAS_HEIGHT             ; 바깥 루프: 줄 수
+
+.y_loop:
+    push cx                           ; 바깥 루프 카운터 보존
+
+    mov cx, CANVAS_WIDTH              ; 한 줄 폭
+    rep movsb                         ; DS:SI(캔버스) → ES:DI(화면)
+
+    pop cx                            ; 줄 수 복원
+
+    ; rep movsb 후:
+    ;   SI = SI + CANVAS_WIDTH
+    ;   DI = DI + CANVAS_WIDTH
+    ; 다음 줄 시작 = DI + (SCREEN_PITCH - CANVAS_WIDTH)
+    add di, SCREEN_PITCH - CANVAS_WIDTH
+
+    loop .y_loop
+
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+; ---------------------------------------------------------
+; [선 그리기] Bresenham 알고리즘
+;   입력: shape_start_x/Y, shape_end_x/Y (캔버스 좌표)
+;   출력: 캔버스에 현재 paint_color로 선을 그림
+; ---------------------------------------------------------
+draw_line_shape:
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    ; x0, y0, x1, y1 로 가져오기
+    mov si, [shape_start_x]   ; SI = x0
+    mov di, [shape_start_y]   ; DI = y0
+    mov ax, [shape_end_x]     ; AX = x1
+    mov bx, [shape_end_y]     ; BX = y1
+
+    mov [line_x1], ax
+    mov [line_y1], bx
+
+    ; dx = |x1 - x0|
+    mov dx, ax
+    sub dx, si                ; dx = x1 - x0
+    mov word [line_sx], 1
+    cmp dx, 0
+    jge .dx_ok
+    neg dx
+    mov word [line_sx], -1
+.dx_ok:
+    mov [line_dx], dx         ; line_dx = |dx|
+
+    ; dy = |y1 - y0|
+    mov dx, bx
+    sub dx, di                ; dy = y1 - y0
+    mov word [line_sy], 1
+    cmp dx, 0
+    jge .dy_ok
+    neg dx
+    mov word [line_sy], -1
+.dy_ok:
+    ; dy_neg = -|dy|
+    neg dx
+    mov [line_dy], dx         ; line_dy = dy_neg (<=0)
+
+    ; err = dx + dy_neg
+    mov ax, [line_dx]
+    add ax, [line_dy]
+    mov [line_err], ax
+
+.line_loop:
+    ; 점 찍기: (si=x0, di=y0)
+    mov bx, si
+    mov ax, di
+    call app_plot_pixel
+
+    ; x0==x1 && y0==y1 이면 종료
+    cmp si, [line_x1]
+    jne .cont
+    cmp di, [line_y1]
+    jne .cont
+    jmp .done
+
+.cont:
+    ; e2 = 2 * err
+    mov ax, [line_err]
+    shl ax, 1
+    mov [line_e2], ax
+
+    ; if (e2 >= dy_neg) { err += dy_neg; x0 += sx; }
+    mov dx, [line_dy]
+    cmp ax, dx                ; e2 < dy_neg 이면 스킵
+    jl  .skip_x
+    add [line_err], dx
+    mov ax, [line_sx]
+    add si, ax
+.skip_x:
+
+    ; if (e2 <= dx_abs) { err += dx_abs; y0 += sy; }
+    mov ax, [line_e2]
+    mov dx, [line_dx]
+    cmp ax, dx
+    jg  .skip_y               ; e2 > dx_abs 이면 스킵
+    add [line_err], dx
+    mov ax, [line_sy]
+    add di, ax
+.skip_y:
+
+    jmp .line_loop
+
+.done:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+; ---------------------------------------------------------
+; [사각형 그리기] 테두리만 그림
+;   입력: shape_start_x/Y, shape_end_x/Y
+; ---------------------------------------------------------
+draw_rect_shape:
+    push ax
+    push bx
+    push cx
+    push dx
+
+    ; x0 = min(start_x, end_x), x1 = max(...)
+    mov ax, [shape_start_x]
+    mov bx, [shape_end_x]
+    cmp ax, bx
+    jle .x_ok
+    xchg ax, bx
+.x_ok:
+    mov [rect_x0], ax
+    mov [rect_x1], bx
+
+    ; y0 = min(start_y, end_y), y1 = max(...)
+    mov ax, [shape_start_y]
+    mov bx, [shape_end_y]
+    cmp ax, bx
+    jle .y_ok
+    xchg ax, bx
+.y_ok:
+    mov [rect_y0], ax
+    mov [rect_y1], bx
+
+    ; -------------------------
+    ; 윗변/아랫변 (수평선)
+    ; -------------------------
+    mov bx, [rect_x0]
+.horiz_loop:
+    mov ax, [rect_y0]
+    call app_plot_pixel        ; 윗변
+
+    mov ax, [rect_y1]
+    call app_plot_pixel        ; 아랫변
+
+    inc bx
+    cmp bx, [rect_x1]
+    jle .horiz_loop
+
+    ; -------------------------
+    ; 좌우 변 (수직선) - 양 끝은 이미 그렸으니 y0+1 ~ y1-1
+    ; -------------------------
+    mov ax, [rect_y0]
+    inc ax                     ; y = y0 + 1
+
+.vert_loop:
+    cmp ax, [rect_y1]
+    jge .done_rect
+
+    mov bx, [rect_x0]
+    call app_plot_pixel        ; 왼쪽 변
+
+    mov bx, [rect_x1]
+    call app_plot_pixel        ; 오른쪽 변
+
+    inc ax
+    jmp .vert_loop
+
+.done_rect:
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
 ; ---------------------------------------------------------
 ; [데이터]
 ; ---------------------------------------------------------
