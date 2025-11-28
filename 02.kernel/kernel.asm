@@ -273,55 +273,52 @@ shutdown_system:
     jmp $
 
 ; ---------------------------------------------------------
-; [시간 관련 함수 (KST +9, Modulo)]
+; [시간 관련 함수] 수정됨
+; 기능: 복잡한 연산 없이 BIOS 시간을 그대로 가져와서 출력
 ; ---------------------------------------------------------
 update_system_time:
+    ; 1. BIOS로 시간 읽기 (RTC)
     mov ah, 0x02
-    int 0x1A
-    ; Hour
-    mov al, ch
-    mov ah, al
-    and al, 0x0F
-    shr ah, 4
-    mov bl, 10
-    xchg al, ah
-    mul bl
-    add al, ah
-    add al, 9
-    xor ah, ah
-    mov bl, 24
-    div bl
-    mov al, ah
-    mov ah, 0
-    mov bl, 10
-    div bl
-    shl al, 4
-    or al, ah
-    mov di, time_str
+    int 0x1A            ; 반환값 -> CH:시, CL:분, DH:초 (모두 BCD 포맷)
+
+    ; 2. 시 (Hour) 출력
+    mov al, ch          ; 시 (예: 오후 1시면 0x13)
+    mov di, time_str    ; 문자열 버퍼 포인터
+    call bcd_to_ascii   ; 변환해서 저장
+
+    ; 3. 분 (Minute) 출력
+    mov al, cl          ; 분
+    add di, 3           ; "HH:" 다음 위치인 'MM' 자리로 이동
     call bcd_to_ascii
-    ; Min
-    mov al, cl
-    mov di, time_str
-    add di, 3
+
+    ; 4. 초 (Second) 출력
+    mov al, dh          ; 초
+    add di, 3           ; "MM:" 다음 위치인 'SS' 자리로 이동
     call bcd_to_ascii
-    ; Sec
-    mov al, dh
-    mov di, time_str
-    add di, 6
-    call bcd_to_ascii
+    
     ret
 
+; ---------------------------------------------------------
+; [BCD to ASCII 변환 함수]
+; 입력: AL (BCD 값, 예: 0x59)
+; 출력: [DI] 위치에 아스키 코드 2글자 기록 ('5', '9')
+; ---------------------------------------------------------
 bcd_to_ascii:
     push ax
     push bx
-    mov bl, al
-    shr al, 4
-    add al, '0'
-    mov [di], al
-    mov al, bl
-    and al, 0x0F
-    add al, '0'
-    mov [di+1], al
+    
+    ; 첫 번째 자리 (10의 자리) 처리
+    mov bl, al          ; AL 값 백업 (예: 0x59)
+    shr al, 4           ; 오른쪽으로 4비트 밀기 (0x59 -> 0x05)
+    add al, '0'         ; 숫자를 문자로 ('0' 더하기)
+    mov [di], al        ; 화면 버퍼에 기록
+
+    ; 두 번째 자리 (1의 자리) 처리
+    mov al, bl          ; 백업해둔 원래 값 복구 (0x59)
+    and al, 0x0F        ; 하위 4비트만 남기기 (0x59 -> 0x09)
+    add al, '0'         ; 숫자를 문자로
+    mov [di+1], al      ; 다음 칸에 기록
+    
     pop bx
     pop ax
     ret
