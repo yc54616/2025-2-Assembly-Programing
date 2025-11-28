@@ -32,8 +32,9 @@ paint_color:    db PAINT_COLOR
 DRAW_MODE_PEN      equ 0
 DRAW_MODE_LINE     equ 1
 DRAW_MODE_RECT     equ 2
-DRAW_MODE_CIRCLE   equ 3        ; (알고리즘 설명만)
+; DRAW_MODE_CIRCLE   equ 3        ; (알고리즘 설명만)
 DRAW_MODE_ELLIPSE  equ 4        ; (알고리즘 설명만)
+DRAW_MODE_ERASER   equ 5        ; [추가] 지우개 모드
 
 current_draw_mode: db DRAW_MODE_PEN   ; 기본은 펜
 
@@ -199,23 +200,22 @@ start_kernel:
 
 .next_loop:
     jmp .main_loop
+
 ; ---------------------------------------------------------
-; [키보드 입력] 1/2/3으로 그리기 모드 변경
-;   '1' : 펜
-;   '2' : 직선
-;   '3' : 사각형
-;   (추후 '4','5'를 원/타원으로 쓸 수 있음)
+; [키보드 입력] 
+;   '1': 펜, '2': 직선, '3': 사각형
+;   '5': 원, '0': 지우개
 ; ---------------------------------------------------------
 check_keyboard_tool:
     push ax
     push bx
 
-    mov ah, 01h          ; 키가 눌렸는지 확인
+    mov ah, 01h
     int 16h
-    jz .no_key           ; 안 눌렸으면 바로 리턴
+    jz .no_key
 
-    mov ah, 00h          ; 키 읽기
-    int 16h              ; AL = ASCII 코드
+    mov ah, 00h
+    int 16h
 
     cmp al, '1'
     je .mode_pen
@@ -223,19 +223,22 @@ check_keyboard_tool:
     je .mode_line
     cmp al, '3'
     je .mode_rect
-    ; 추후 '4','5' 추가 가능
+    cmp al, '0'         ; [추가] 지우개
+    je .mode_eraser
+
     jmp .no_key
 
 .mode_pen:
     mov byte [current_draw_mode], DRAW_MODE_PEN
     jmp .no_key
-
 .mode_line:
     mov byte [current_draw_mode], DRAW_MODE_LINE
     jmp .no_key
-
 .mode_rect:
     mov byte [current_draw_mode], DRAW_MODE_RECT
+    jmp .no_key
+.mode_eraser:           ; [추가]
+    mov byte [current_draw_mode], DRAW_MODE_ERASER
     jmp .no_key
 
 .no_key:
@@ -689,10 +692,10 @@ draw_window:
 
     ; --- 'X' 문자 그리기 (버튼 안쪽에)
     mov ax, dx                    ; btn_x
-    add ax, 2                     ; 약간 안쪽으로
+    ; add ax, 2                     ; 약간 안쪽으로
     mov bx, [window_y]
     add bx, [close_btn_off_y]
-    add bx, 1                     ; 세로로도 약간 내림
+    ; add bx, 1                     ; 세로로도 약간 내림
 
     push word 0x0F
     push str_x
@@ -1269,115 +1272,163 @@ app_init:
     pop cx
     pop ax
     ret
+
 ; ---------------------------------------------------------
 ; [앱 입력 처리]
-;   - 창 열려 있을 때만 동작
-;   - 현재 그리기 모드에 따라 동작 분기
-;       * 펜 모드 : 버튼 누른 동안 계속 점 찍기
-;       * 선/사각형 : 첫 클릭에 시작점 저장, 버튼을 뗄 때 도형 한 번 그림
-;   - 팔레트 클릭은 기존처럼 먼저 처리
 ; ---------------------------------------------------------
 app_handle_input:
-    ; 창이 안 열려 있으면 무시
     cmp byte [is_window_open], 1
     jne .end
 
-    ; 현재/이전 마우스 버튼 상태 읽기
-    mov bl, [mouse_btn_last]   ; 이전 프레임 상태
-    mov bh, [mouse_btn_left]   ; 현재 상태 (0 or 1)
+    mov bl, [mouse_btn_last]
+    mov bh, [mouse_btn_left]
 
-    ; ------------------------
-    ; 1) 색상 팔레트 클릭 (현재가 눌린 상태면 매번 확인해도 무방)
-    ; ------------------------
+    ; 1) 팔레트 클릭
     cmp bh, 1
     jne .after_palette
-
     call app_check_palette_click
     cmp ax, 1
-    je .end                    ; 팔레트 클릭이면 여기서 끝
-
+    je .end
 .after_palette:
 
-    ; ------------------------
-    ; 2) 펜 모드 (DRAW_MODE_PEN)
-    ; ------------------------
-    cmp byte [current_draw_mode], DRAW_MODE_PEN
-    jne .shape_mode
+    ; 2) 펜 또는 지우개 (연속 그리기)
+    mov al, [current_draw_mode]
+    cmp al, DRAW_MODE_PEN
+    je .continuous_draw
+    cmp al, DRAW_MODE_ERASER
+    je .continuous_draw
+    jmp .shape_mode
 
-    ; 펜 모드에서는 버튼이 눌려 있는 동안 계속 점 찍기
+.continuous_draw:
     cmp bh, 1
     jne .end
 
     call canvas_from_mouse
-    jc   .end                  ; 캔버스 밖이면 무시
+    jc   .end
+    ; 현재 AX=canvas_y, BX=canvas_x
 
-    ; AX = canvas_y, BX = canvas_x
+    cmp byte [current_draw_mode], DRAW_MODE_ERASER
+    je .do_eraser_big    ; [수정] 큰 지우개 로직으로 점프
+
+    ; [일반 펜]
     call app_plot_pixel
+    jmp .pen_finish
+
+.do_eraser_big:
+    ; -----------------------------------------------------
+    ; [지우개 확대 로직] 9x9 크기 정사각형 (중심 기준 -4 ~ +4)
+    ; -----------------------------------------------------
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push word [paint_color]      ; 기존 색상 백업
+
+    mov byte [paint_color], 0x0F ; 흰색 설정
+
+    mov cx, bx  ; CX = 중심 X
+    mov dx, ax  ; DX = 중심 Y
+
+    ; Y 루프: -4 ~ +4
+    mov si, -8
+.er_loop_y:
+    cmp si, 8
+    jg .er_done
+
+    ; X 루프: -4 ~ +4
+    mov di, -8
+.er_loop_x:
+    cmp di, 8
+    jg .er_next_y
+
+    ; 그릴 좌표 계산: BX = center_x + di, AX = center_y + si
+    mov bx, cx
+    add bx, di
+    mov ax, dx
+    add ax, si
+
+    call app_plot_pixel ; 픽셀 찍기 (범위 벗어나면 함수 내부에서 무시됨)
+
+    inc di
+    jmp .er_loop_x
+
+.er_next_y:
+    inc si
+    jmp .er_loop_y
+
+.er_done:
+    pop word [paint_color]       ; 색상 복구
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ; -----------------------------------------------------
+
+.pen_finish:
     mov word [needs_redraw], 1
     jmp .end
 
-; ------------------------
-; 3) 도형 모드 (선/사각형 등)
-; ------------------------
 .shape_mode:
-    ; (1) 버튼이 눌리는 순간 (bl=0, bh=1) → 시작점 저장
+    ; (1) 시작점
     cmp bl, 0
     jne .check_release
     cmp bh, 1
     jne .check_release
 
-    ; 시작점 = 클릭 위치 (캔버스 안일 때만)
     call canvas_from_mouse
-    jc   .end                   ; 캔버스 밖에서 누르면 무시
-
+    jc   .end
     mov [shape_start_y], ax
     mov [shape_start_x], bx
     mov byte [shape_pending], 1
     jmp .end
 
 .check_release:
-    ; (2) 버튼을 떼는 순간 (bl=1, bh=0) → 끝점 + 도형 그리기
+    ; (2) 끝점
     cmp bl, 1
     jne .end
     cmp bh, 0
     jne .end
 
     cmp byte [shape_pending], 1
-    jne .end                    ; 시작점 없으면 무시
+    jne .end
 
-    ; 끝점 = 버튼 뗀 위치 (캔버스 안일 때만)
     call canvas_from_mouse
-    jc   .cancel_shape          ; 캔버스 밖에서 떼면 취소
-
+    jc   .cancel_shape
     mov [shape_end_y], ax
     mov [shape_end_x], bx
 
-    ; 현재 모드에 따라 선/사각형 그리기
     mov al, [current_draw_mode]
     cmp al, DRAW_MODE_LINE
     je  .do_line
     cmp al, DRAW_MODE_RECT
     je  .do_rect
-    jmp .finish_shape           ; (원/타원 모드 아직은 미구현)
+    ; cmp al, DRAW_MODE_CIRCLE  <-- 삭제
+    ; je  .do_circle            <-- 삭제
+    jmp .finish_shape
 
 .do_line:
     call draw_line_shape
     jmp .finish_shape
-
 .do_rect:
     call draw_rect_shape
     jmp .finish_shape
+; .do_circle:                   <-- 삭제
+;    call draw_circle_shape     <-- 삭제
+;    jmp .finish_shape          <-- 삭제
 
 .cancel_shape:
-    ; 취소 시 아무것도 그리지 않음
     jmp .finish_shape
 
 .finish_shape:
     mov byte [shape_pending], 0
     mov word [needs_redraw], 1
-
 .end:
     ret
+
 ; ---------------------------------------------------------
 ; [팔레트 클릭 처리]
 ;   - 마우스가 팔레트 영역 안을 클릭했으면 paint_color 변경
@@ -1685,6 +1736,7 @@ draw_rect_shape:
     pop bx
     pop ax
     ret
+
 ; ---------------------------------------------------------
 ; [데이터]
 ; ---------------------------------------------------------
