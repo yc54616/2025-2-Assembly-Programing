@@ -247,30 +247,70 @@ check_keyboard_tool:
     ret
 
 ; ---------------------------------------------------------
-; [시스템 종료 로직 (APM)]
+; [시스템 종료] APM -> QEMU -> VirtualBox 순서로 시도
 ; ---------------------------------------------------------
 shutdown_system:
-    ; APM Connect
+    ; 1. [APM] 연결 시도 (APM Connect)
     mov ax, 0x5301
-    xor bx, bx
+    xor bx, bx          ; Device ID: 0x0000 (System BIOS)
     int 0x15
+    jc .try_qemu        ; 실패하면 QEMU 방식 시도
 
-    ; APM Enable Power Management
+    ; 2. [APM] 전원 관리 활성화 (Enable Power Management)
     mov ax, 0x5308
-    mov bx, 0x0001
-    mov cx, 0x0001
+    mov bx, 0x0001      ; All devices
+    mov cx, 0x0001      ; Enable
     int 0x15
+    jc .try_qemu
 
-    ; APM Set Power State (OFF)
+    ; 3. [APM] 전원 끄기 (Set Power State: OFF)
     mov ax, 0x5307
-    mov bx, 0x0001
-    mov cx, 0x0003
+    mov bx, 0x0001      ; All devices
+    mov cx, 0x0003      ; State: 3 (Off)
     int 0x15
+    ; 여기서 꺼지면 아래 코드는 실행 안 됨
 
-    ; 실패 시 무한 루프 (hlt)
+.try_qemu:
+    ; 4. [QEMU] 구버전/신버전 강제 종료 포트
+    ; (QEMU 에뮬레이터에서 주로 작동)
+    mov dx, 0x604
+    mov ax, 0x2000
+    out dx, ax
+
+.try_vbox:
+    ; 5. [VirtualBox] 강제 종료 포트
+    mov dx, 0x4004
+    mov ax, 0x3400
+    out dx, ax
+
+.fail:
+    ; 6. 모든 방법 실패 시 메시지 출력 후 무한 대기
+    ; (화면을 지우고 메시지를 띄움)
+    call clear_screen
+    
+    mov si, msg_shutdown_fail
+    mov ax, 0xB800      ; 비디오 메모리 직접 접근 (간단 출력)
+    mov es, ax
+    xor di, di
+    
+    mov cx, 0
+.print_msg:
+    lodsb
+    cmp al, 0
+    je .halt_cpu
+    mov byte [es:di], al
+    inc di
+    mov byte [es:di], 0x4F ; 빨간 배경 흰 글씨
+    inc di
+    jmp .print_msg
+
+.halt_cpu:
     cli
     hlt
-    jmp $
+    jmp .halt_cpu
+
+; 종료 실패 메시지
+msg_shutdown_fail: db "Shutdown Failed. Please turn off power manually.", 0
 
 ; ---------------------------------------------------------
 ; [시간 관련 함수] 수정됨
