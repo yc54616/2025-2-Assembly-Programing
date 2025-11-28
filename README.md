@@ -7,8 +7,16 @@
 <img width="643" height="479" alt="image" src="https://github.com/user-attachments/assets/c2da4480-31bd-498c-959c-4149c59ca5de" />
 
 
-### build
+### Build
 ```sh
 > ./build.sh
-> qemu-system-i386 -fda floppy.img
+> qemu-system-i386 -rtc base=localtime -fda floppy.img
+```
+
+### Key Function
+```text
+0: erase (pixel: 8)
+1: pen
+2: line
+3; rectangle
 ```
